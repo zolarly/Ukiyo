@@ -1,0 +1,10 @@
+{
+  "addr": ":8080",
+  "data_dir": "data",
+  "ttl": "24h",
+  "max_upload_mb": 300,
+  "max_total_mb": 20000,
+  "invite_codes": ["换成你的邀请码"],
+  "android_package": "io.github.zolarly.ukiyo",
+  "android_cert_sha256": ""
+}

@@ -11,9 +11,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"html/template"
 	"io"
+	"io/fs"
 	"log"
 	"mime"
 	"net/http"
@@ -22,14 +24,59 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 type config struct {
-	dataDir  string
-	ttl      time.Duration
-	maxBytes int64
-	codes    []string
+	Addr              string   `json:"addr"`
+	DataDir           string   `json:"data_dir"`
+	TTL               duration `json:"ttl"`
+	MaxUploadMB       int64    `json:"max_upload_mb"`
+	MaxTotalMB        int64    `json:"max_total_mb"`
+	InviteCodes       []string `json:"invite_codes"`
+	AndroidPackage    string   `json:"android_package"`
+	AndroidCertSHA256 string   `json:"android_cert_sha256"`
+}
+
+// duration reads "24h"-style strings from JSON.
+type duration struct{ time.Duration }
+
+func (d *duration) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	v, err := time.ParseDuration(s)
+	d.Duration = v
+	return err
+}
+
+// loadConfig reads the JSON config at path. Every field except invite_codes has a default;
+// unknown fields are rejected so a typo doesn't silently fall back to a default.
+func loadConfig(path string) (config, error) {
+	cfg := config{Addr: ":8080", DataDir: "data", TTL: duration{24 * time.Hour}, MaxUploadMB: 300, MaxTotalMB: 20000}
+	f, err := os.Open(path)
+	if err != nil {
+		return cfg, err
+	}
+	defer f.Close()
+	dec := json.NewDecoder(f)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
+		return cfg, fmt.Errorf("%s: %w", path, err)
+	}
+	var codes []string
+	for _, c := range cfg.InviteCodes {
+		if c = strings.TrimSpace(c); c != "" {
+			codes = append(codes, c)
+		}
+	}
+	if len(codes) == 0 {
+		return cfg, errors.New("invite_codes is required")
+	}
+	cfg.InviteCodes = codes
+	return cfg, nil
 }
 
 type fileMeta struct {
@@ -39,34 +86,29 @@ type fileMeta struct {
 }
 
 type share struct {
-	Created time.Time  `json:"created"`
-	Files   []fileMeta `json:"files"`
+	Created   time.Time  `json:"created"`
+	Files     []fileMeta `json:"files"`
+	DeleteKey string     `json:"delete_key"`
 }
 
-type server struct{ cfg config }
+type server struct {
+	cfg config
+
+	mu       sync.Mutex
+	reserved int64 // bytes claimed by uploads still in flight
+}
 
 var tokenRe = regexp.MustCompile(`^[A-Za-z0-9_-]{22}$`)
 
 func main() {
-	ttl, err := time.ParseDuration(env("UKIYO_TTL", "24h"))
+	path := flag.String("config", "config.json", "path to the JSON config file")
+	flag.Parse()
+	cfg, err := loadConfig(*path)
 	if err != nil {
-		log.Fatal("UKIYO_TTL: ", err)
+		log.Fatal("config: ", err)
 	}
-	maxMB, err := strconv.ParseInt(env("UKIYO_MAX_MB", "300"), 10, 64)
-	if err != nil {
-		log.Fatal("UKIYO_MAX_MB: ", err)
-	}
-	var codes []string
-	for _, c := range strings.Split(os.Getenv("UKIYO_INVITE_CODES"), ",") {
-		if c = strings.TrimSpace(c); c != "" {
-			codes = append(codes, c)
-		}
-	}
-	if len(codes) == 0 {
-		log.Fatal("UKIYO_INVITE_CODES is required (comma separated)")
-	}
-	s := &server{config{env("UKIYO_DATA", "data"), ttl, maxMB << 20, codes}}
-	if err := os.MkdirAll(s.cfg.dataDir, 0o700); err != nil {
+	s := &server{cfg: cfg}
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		log.Fatal(err)
 	}
 	go func() {
@@ -75,18 +117,10 @@ func main() {
 			time.Sleep(10 * time.Minute)
 		}
 	}()
-	addr := env("UKIYO_ADDR", ":8080")
-	log.Printf("ukiyo listening on %s, data in %s, ttl %s", addr, s.cfg.dataDir, ttl)
+	log.Printf("ukiyo listening on %s, data in %s, ttl %s", cfg.Addr, cfg.DataDir, cfg.TTL.Duration)
 	// No ReadTimeout: a 300MB upload over a 3Mbps line legitimately takes minutes.
-	srv := &http.Server{Addr: addr, Handler: s.routes(), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: cfg.Addr, Handler: s.routes(), ReadHeaderTimeout: 10 * time.Second}
 	log.Fatal(srv.ListenAndServe())
-}
-
-func env(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
 }
 
 func (s *server) routes() http.Handler {
@@ -97,14 +131,16 @@ func (s *server) routes() http.Handler {
 	})
 	mux.HandleFunc("POST /api/shares", s.createShare)
 	mux.HandleFunc("GET /api/shares/{token}", s.shareJSON)
+	mux.HandleFunc("DELETE /api/shares/{token}", s.deleteShare)
 	mux.HandleFunc("GET /s/{token}", s.sharePage)
 	mux.HandleFunc("GET /s/{token}/{index}", s.serveFile)
+	mux.HandleFunc("GET /.well-known/assetlinks.json", s.assetLinks)
 	return mux
 }
 
 func (s *server) validCode(code string) bool {
 	ok := 0
-	for _, c := range s.cfg.codes {
+	for _, c := range s.cfg.InviteCodes {
 		ok |= subtle.ConstantTimeCompare([]byte(code), []byte(c))
 	}
 	return ok == 1
@@ -116,19 +152,61 @@ func newToken() string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
+// reserve claims n bytes of the max_total_mb quota for an upload, counting both what is on disk
+// and what other in-flight uploads have claimed. Counting is conservative: an upload's partial temp
+// files are on disk and in reserved at the same time.
+func (s *server) reserve(n int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.diskUsage()+s.reserved+n > s.cfg.MaxTotalMB<<20 {
+		return false
+	}
+	s.reserved += n
+	return true
+}
+
+func (s *server) release(n int64) {
+	s.mu.Lock()
+	s.reserved -= n
+	s.mu.Unlock()
+}
+
+func (s *server) diskUsage() int64 {
+	var total int64
+	filepath.WalkDir(s.cfg.DataDir, func(_ string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			if info, err := d.Info(); err == nil {
+				total += info.Size()
+			}
+		}
+		return nil
+	})
+	return total
+}
+
 func (s *server) createShare(w http.ResponseWriter, r *http.Request) {
 	if !s.validCode(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")) {
 		http.Error(w, "invalid invite code", http.StatusUnauthorized)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.maxBytes)
+	// Oversized or unknown-length bodies count as the per-upload max; MaxBytesReader rejects the rest with 413.
+	n := r.ContentLength
+	if n < 0 || n > s.cfg.MaxUploadMB<<20 {
+		n = s.cfg.MaxUploadMB << 20
+	}
+	if !s.reserve(n) {
+		http.Error(w, "storage full", http.StatusInsufficientStorage)
+		return
+	}
+	defer s.release(n)
+	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxUploadMB<<20)
 	mr, err := r.MultipartReader()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	// Write into a temp dir and rename at the end, so a half-finished upload is never visible.
-	tmp, err := os.MkdirTemp(s.cfg.dataDir, ".tmp-")
+	tmp, err := os.MkdirTemp(s.cfg.DataDir, ".tmp-")
 	if err != nil {
 		http.Error(w, "storage error", http.StatusInternalServerError)
 		return
@@ -168,6 +246,7 @@ func (s *server) createShare(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `no files in field "file"`, http.StatusBadRequest)
 		return
 	}
+	sh.DeleteKey = newToken()
 	sh.Created = time.Now()
 	meta, _ := json.Marshal(sh)
 	if err := os.WriteFile(filepath.Join(tmp, "meta.json"), meta, 0o600); err != nil {
@@ -175,14 +254,15 @@ func (s *server) createShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := newToken()
-	if err := os.Rename(tmp, filepath.Join(s.cfg.dataDir, token)); err != nil {
+	if err := os.Rename(tmp, filepath.Join(s.cfg.DataDir, token)); err != nil {
 		http.Error(w, "storage error", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, map[string]any{
 		"token":      token,
 		"url":        baseURL(r) + "/s/" + token,
-		"expires_at": sh.Created.Add(s.cfg.ttl),
+		"expires_at": sh.Created.Add(s.cfg.TTL.Duration),
+		"delete_key": sh.DeleteKey,
 	})
 }
 
@@ -209,12 +289,12 @@ func (s *server) load(token string) *share {
 	if !tokenRe.MatchString(token) {
 		return nil
 	}
-	b, err := os.ReadFile(filepath.Join(s.cfg.dataDir, token, "meta.json"))
+	b, err := os.ReadFile(filepath.Join(s.cfg.DataDir, token, "meta.json"))
 	if err != nil {
 		return nil
 	}
 	var sh share
-	if json.Unmarshal(b, &sh) != nil || time.Since(sh.Created) > s.cfg.ttl {
+	if json.Unmarshal(b, &sh) != nil || time.Since(sh.Created) > s.cfg.TTL.Duration {
 		return nil
 	}
 	return &sh
@@ -235,7 +315,43 @@ func (s *server) shareJSON(w http.ResponseWriter, r *http.Request) {
 	for i, f := range sh.Files {
 		files[i] = file{f, fmt.Sprintf("%s/s/%s/%d", baseURL(r), token, i)}
 	}
-	writeJSON(w, map[string]any{"files": files, "expires_at": sh.Created.Add(s.cfg.ttl)})
+	writeJSON(w, map[string]any{"files": files, "expires_at": sh.Created.Add(s.cfg.TTL.Duration)})
+}
+
+// deleteShare lets the sender destroy a share early with the delete_key returned at creation.
+func (s *server) deleteShare(w http.ResponseWriter, r *http.Request) {
+	token := r.PathValue("token")
+	sh := s.load(token)
+	if sh == nil {
+		http.NotFound(w, r)
+		return
+	}
+	key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if sh.DeleteKey == "" || subtle.ConstantTimeCompare([]byte(key), []byte(sh.DeleteKey)) != 1 {
+		http.Error(w, "invalid delete key", http.StatusForbidden)
+		return
+	}
+	if err := os.RemoveAll(filepath.Join(s.cfg.DataDir, token)); err != nil {
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// assetLinks proves to Android that the app owns this domain, so /s/ links open in the app (App Links).
+func (s *server) assetLinks(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AndroidPackage == "" || s.cfg.AndroidCertSHA256 == "" {
+		http.NotFound(w, r)
+		return
+	}
+	writeJSON(w, []map[string]any{{
+		"relation": []string{"delegate_permission/common.handle_all_urls"},
+		"target": map[string]any{
+			"namespace":                "android_app",
+			"package_name":             s.cfg.AndroidPackage,
+			"sha256_cert_fingerprints": []string{s.cfg.AndroidCertSHA256},
+		},
+	}})
 }
 
 func (s *server) serveFile(w http.ResponseWriter, r *http.Request) {
@@ -246,7 +362,7 @@ func (s *server) serveFile(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	f, err := os.Open(filepath.Join(s.cfg.dataDir, token, strconv.Itoa(i)))
+	f, err := os.Open(filepath.Join(s.cfg.DataDir, token, strconv.Itoa(i)))
 	if err != nil {
 		http.NotFound(w, r)
 		return
@@ -281,7 +397,7 @@ func (s *server) sharePage(w http.ResponseWriter, r *http.Request) {
 		sharePage.Execute(w, nil)
 		return
 	}
-	left := time.Until(sh.Created.Add(s.cfg.ttl))
+	left := time.Until(sh.Created.Add(s.cfg.TTL.Duration))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	sharePage.Execute(w, map[string]any{
 		"Token":  token,
@@ -299,17 +415,17 @@ func writeJSON(w http.ResponseWriter, v any) {
 // sweep deletes every share (and abandoned temp upload) older than the TTL.
 // A share dir's mtime is when its last file was written, i.e. upload completion.
 func (s *server) sweep() {
-	entries, err := os.ReadDir(s.cfg.dataDir)
+	entries, err := os.ReadDir(s.cfg.DataDir)
 	if err != nil {
 		log.Print("sweep: ", err)
 		return
 	}
 	for _, e := range entries {
 		info, err := e.Info()
-		if err != nil || time.Since(info.ModTime()) <= s.cfg.ttl {
+		if err != nil || time.Since(info.ModTime()) <= s.cfg.TTL.Duration {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(s.cfg.dataDir, e.Name())); err != nil {
+		if err := os.RemoveAll(filepath.Join(s.cfg.DataDir, e.Name())); err != nil {
 			log.Print("sweep: ", err)
 		}
 	}
