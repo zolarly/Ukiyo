@@ -4,7 +4,10 @@
   "ttl": "24h",
   "max_upload_mb": 300,
   "max_total_mb": 20000,
-  "invite_codes": ["换成你的邀请码"],
+  "daily_upload_mb": 2048,
+  "max_views_options": [0, 1, 3, 5],
+  "redis_addr": "127.0.0.1:6379",
+  "jwt_secret": "换成至少 32 位的随机字符串",
   "android_package": "io.github.zolarly.ukiyo",
   "android_cert_sha256": ""
 }
