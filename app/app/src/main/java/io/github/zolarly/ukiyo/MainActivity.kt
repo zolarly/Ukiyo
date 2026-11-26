@@ -2,42 +2,53 @@ package io.github.zolarly.ukiyo
 
 import android.content.ClipboardManager
 import android.content.Intent
+import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Button
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.runtime.Composable
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.unit.dp
 import androidx.core.content.IntentCompat
-import io.github.zolarly.ukiyo.history.HistoryScreen
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import io.github.zolarly.ukiyo.history.MineScreen
 import io.github.zolarly.ukiyo.login.LoginScreen
 import io.github.zolarly.ukiyo.net.Api
 import io.github.zolarly.ukiyo.net.ShareLink
 import io.github.zolarly.ukiyo.net.findShareLink
-import io.github.zolarly.ukiyo.receive.ReceiveScreen
+import io.github.zolarly.ukiyo.receive.ReceiveTab
 import io.github.zolarly.ukiyo.send.SendScreen
-import io.github.zolarly.ukiyo.settings.SettingsScreen
+import io.github.zolarly.ukiyo.send.UploadState
+import io.github.zolarly.ukiyo.ui.SealBar
+import io.github.zolarly.ukiyo.ui.Sky
+import io.github.zolarly.ukiyo.ui.pageMotion
 import io.github.zolarly.ukiyo.ui.theme.UkiyoTheme
 import java.io.File
 
@@ -45,18 +56,19 @@ import java.io.File
 // Activity 重建（比如切换深色模式）不会误删正在下载的文件。
 private var receiveCacheCleared = false
 
-sealed interface Screen {
-    data object Home : Screen
-    data object Settings : Screen
-    data object History : Screen
-    data class Send(val uris: List<Uri>) : Screen
-    data class Receive(val link: ShareLink) : Screen
-    data class Login(val then: Screen) : Screen
-}
+private const val SEND = 0
+private const val RECEIVE = 1
+private const val MINE = 2
 
 class MainActivity : ComponentActivity() {
-    private var screen by mutableStateOf<Screen>(Screen.Home)
     private val prefs by lazy { Prefs(this) }
+    private var tab by mutableIntStateOf(SEND)
+    private var sending by mutableStateOf<List<Uri>>(emptyList())
+    private var receiving by mutableStateOf<ShareLink?>(null)
+    private var account by mutableStateOf<String?>(null)
+
+    // 不为 null 时盖上登录页；登录成功后执行它。
+    private var afterLogin by mutableStateOf<(() -> Unit)?>(null)
 
     private val picker = registerForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { uris ->
         if (uris.isNotEmpty()) openSend(uris)
@@ -71,8 +83,11 @@ class MainActivity : ComponentActivity() {
             Toast.makeText(this, "还有文件正在上传，完成后再发送", Toast.LENGTH_SHORT).show()
             return
         }
-        val send = Screen.Send(uris)
-        screen = if (prefs.loggedIn) send else Screen.Login(then = send)
+        val show = {
+            sending = uris
+            tab = SEND
+        }
+        if (prefs.loggedIn) show() else afterLogin = show
     }
 
     private fun pasteLink() {
@@ -87,37 +102,95 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun openReceive(link: ShareLink) {
-        screen = Screen.Receive(link)
+        receiving = link
+        tab = RECEIVE
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        enableEdgeToEdge(SystemBarStyle.dark(Color.TRANSPARENT), SystemBarStyle.dark(Color.TRANSPARENT))
         Api.init(prefs)
+        account = prefs.username
         if (!receiveCacheCleared) {
             File(cacheDir, "receive").deleteRecursively()
             receiveCacheCleared = true
         }
         setContent {
             UkiyoTheme {
-                Scaffold(modifier = Modifier.fillMaxSize()) { padding ->
-                    Box(Modifier.padding(padding).padding(16.dp)) {
-                        when (val s = screen) {
-                            Screen.Home -> HomeScreen(
-                                onSend = ::pickMedia,
-                                onReceive = ::pasteLink,
-                                onHistory = { screen = if (prefs.loggedIn) Screen.History else Screen.Login(then = Screen.History) },
-                                onSettings = { screen = Screen.Settings },
-                            )
-                            Screen.History -> HistoryScreen(onLogin = { screen = Screen.Login(then = Screen.History) })
-                            Screen.Settings -> SettingsScreen(prefs, onDone = { screen = Screen.Home })
-                            is Screen.Send -> SendScreen(s.uris, onLogin = { screen = Screen.Login(then = s) })
-                            is Screen.Receive -> ReceiveScreen(s.link)
-                            is Screen.Login -> LoginScreen(prefs, onDone = { screen = s.then })
+                val pager = rememberPagerState(initialPage = tab) { 3 }
+                // tab 和翻页互相同步：点底栏或收到链接时改 tab，翻页停稳后再写回 tab。
+                LaunchedEffect(tab) { pager.animateScrollToPage(tab) }
+                LaunchedEffect(pager) { snapshotFlow { pager.settledPage }.collect { tab = it } }
+                val upload by Transfers.upload.collectAsStateWithLifecycle()
+                val loginOpen = afterLogin != null
+                val blur by animateDpAsState(if (loginOpen) 18.dp else 0.dp, label = "blur")
+
+                Box(Modifier.fillMaxSize()) {
+                    Box(Modifier.fillMaxSize().blur(blur)) {
+                        Sky(position = { pager.currentPage + pager.currentPageOffsetFraction })
+                        // 三页都常驻（beyondViewportPageCount = 2），翻走时不会销毁接收页、打断下载。
+                        HorizontalPager(pager, Modifier.fillMaxSize(), beyondViewportPageCount = 2) { page ->
+                            Box(
+                                Modifier
+                                    .fillMaxSize()
+                                    .pageMotion(pager, page)
+                                    .statusBarsPadding()
+                                    .navigationBarsPadding()
+                                    .padding(start = 24.dp, end = 24.dp, bottom = 100.dp),
+                            ) {
+                                when (page) {
+                                    SEND -> SendScreen(
+                                        uris = sending,
+                                        onPick = ::pickMedia,
+                                        onLogin = { afterLogin = {} },
+                                    )
+                                    RECEIVE -> ReceiveTab(receiving, onPaste = ::pasteLink, onClose = { receiving = null })
+                                    else -> MineScreen(
+                                        prefs,
+                                        account,
+                                        visible = pager.settledPage == MINE,
+                                        onLogin = { afterLogin = {} },
+                                        onAccountChange = { account = prefs.username },
+                                    )
+                                }
+                            }
                         }
+                        SealBar(
+                            pager,
+                            onSelect = { tab = it },
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .navigationBarsPadding()
+                                .padding(start = 48.dp, end = 48.dp, bottom = 16.dp),
+                        )
+                    }
+                    AnimatedVisibility(
+                        loginOpen,
+                        enter = fadeIn() + slideInVertically { it / 4 },
+                        exit = fadeOut() + slideOutVertically { it / 4 },
+                    ) {
+                        LoginScreen(
+                            prefs,
+                            onDone = {
+                                val then = afterLogin
+                                afterLogin = null
+                                account = prefs.username
+                                then?.invoke()
+                            },
+                            onCancel = { afterLogin = null },
+                        )
                     }
                 }
-                BackHandler(enabled = screen != Screen.Home) { screen = Screen.Home }
+
+                val uploading = upload is UploadState.Uploading
+                BackHandler(enabled = loginOpen || tab != SEND || (sending.isNotEmpty() && !uploading)) {
+                    when {
+                        loginOpen -> afterLogin = null
+                        tab == RECEIVE && receiving != null -> receiving = null
+                        tab != SEND -> tab = SEND
+                        else -> sending = emptyList()
+                    }
+                }
             }
         }
         if (savedInstanceState == null) handleIntent(intent)
@@ -141,17 +214,5 @@ class MainActivity : ComponentActivity() {
             else -> emptyList()
         }
         if (uris.isNotEmpty()) openSend(uris)
-    }
-}
-
-@Composable
-fun HomeScreen(onSend: () -> Unit, onReceive: () -> Unit, onHistory: () -> Unit, onSettings: () -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text("浮世", style = MaterialTheme.typography.headlineMedium)
-        Text("原图互传，24 小时后销毁", style = MaterialTheme.typography.bodyMedium)
-        Button(onClick = onSend, modifier = Modifier.fillMaxWidth()) { Text("发送照片") }
-        OutlinedButton(onClick = onReceive, modifier = Modifier.fillMaxWidth()) { Text("接收（粘贴链接）") }
-        TextButton(onClick = onHistory) { Text("我发出的") }
-        TextButton(onClick = onSettings) { Text("设置") }
     }
 }

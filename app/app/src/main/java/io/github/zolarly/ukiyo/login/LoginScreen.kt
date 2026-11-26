@@ -1,13 +1,20 @@
 package io.github.zolarly.ukiyo.login
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.Button
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -22,13 +29,20 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import io.github.zolarly.ukiyo.Prefs
 import io.github.zolarly.ukiyo.net.Api
+import io.github.zolarly.ukiyo.ui.GhostButton
+import io.github.zolarly.ukiyo.ui.GlowButton
+import io.github.zolarly.ukiyo.ui.TextAction
+import io.github.zolarly.ukiyo.ui.theme.Abyss
+import io.github.zolarly.ukiyo.ui.theme.Dim
+import io.github.zolarly.ukiyo.ui.theme.Ember
+import io.github.zolarly.ukiyo.ui.theme.Moon
 import java.io.IOException
 import kotlinx.coroutines.launch
 
 private val usernameRe = Regex("[A-Za-z0-9_]{3,20}")
 
 @Composable
-fun LoginScreen(prefs: Prefs, onDone: () -> Unit) {
+fun LoginScreen(prefs: Prefs, onDone: () -> Unit, onCancel: () -> Unit) {
     var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
@@ -50,15 +64,29 @@ fun LoginScreen(prefs: Prefs, onDone: () -> Unit) {
         }
     }
 
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text("登录", style = MaterialTheme.typography.headlineSmall)
-        Text("服务器：${prefs.server}", style = MaterialTheme.typography.bodySmall)
+    val field = RoundedCornerShape(18.dp)
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(Abyss.copy(alpha = 0.82f))
+            .systemBarsPadding()
+            .imePadding()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 28.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        TextAction("返回", onCancel, Dim)
+        Spacer(Modifier.height(48.dp))
+        Text("登录", style = MaterialTheme.typography.displayMedium, color = Moon)
+        Text("发送需要账号，接收不需要。服务器 ${prefs.server.substringAfter("://")}", style = MaterialTheme.typography.bodyMedium, color = Dim)
+        Spacer(Modifier.height(12.dp))
         OutlinedTextField(
             value = username,
             onValueChange = { username = it.trim() },
             label = { Text("用户名") },
             supportingText = { Text("3–20 位字母、数字或下划线") },
             singleLine = true,
+            shape = field,
             modifier = Modifier.fillMaxWidth(),
         )
         OutlinedTextField(
@@ -69,12 +97,12 @@ fun LoginScreen(prefs: Prefs, onDone: () -> Unit) {
             visualTransformation = PasswordVisualTransformation(),
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
             singleLine = true,
+            shape = field,
             modifier = Modifier.fillMaxWidth(),
         )
-        error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Button(onClick = { submit(register = false) }, enabled = valid && !busy) { Text("登录") }
-            OutlinedButton(onClick = { submit(register = true) }, enabled = valid && !busy) { Text("注册") }
-        }
+        error?.let { Text(it, color = Ember) }
+        GlowButton("登录", { submit(register = false) }, Modifier.fillMaxWidth(), enabled = valid && !busy)
+        GhostButton("注册新账号", { submit(register = true) }, Modifier.fillMaxWidth(), enabled = valid && !busy)
+        Spacer(Modifier.height(24.dp))
     }
 }

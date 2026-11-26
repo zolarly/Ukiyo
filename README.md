@@ -7,8 +7,7 @@
 ## 目录
 
 - `server/` Go 后端，单个静态二进制（纯 Go SQLite，无需 cgo），另需一个 Redis
-- `app/` Kotlin 原生安卓客户端（待开发）
-- `docs/requirements.md` 需求文档
+- `app/` Kotlin 原生安卓客户端（Jetpack Compose，minSdk 29）
 
 ## 本地运行
 
@@ -18,6 +17,12 @@ cd server
 cp config.example.json config.json   # 填写 jwt_secret
 go run .                              # 默认读取 ./config.json，可以用 -config 指定路径
 go test ./...                         # 测试用 miniredis，不需要真 Redis
+```
+
+App 默认连接的服务器地址来自 `app/gradle.properties` 的 `ukiyo.server`（仓库里是占位值）。本机联调时把真实地址写进 `~/.gradle/gradle.properties`，会覆盖占位值且不进仓库：
+
+```properties
+ukiyo.server=http://192.168.x.x:8090
 ```
 
 | 配置项 | 默认 | 说明 |
