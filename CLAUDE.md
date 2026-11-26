@@ -4,7 +4,7 @@
 
 ## 结构
 
-- `server/`：Go 后端，已完成并通过测试。只用标准库，没有数据库，每个分享就是 data 目录下的一个文件夹。
+- `server/`：Go 后端。账号和分享元数据存 SQLite，查看次数、票据、续期令牌和限流计数存 Redis，原文件按分享存在 data 目录下的文件夹里。
 - `app/`：Kotlin 原生安卓 App（待开发）。只做安卓，不做 iOS。
 
 ## 与用户协作
@@ -17,6 +17,6 @@
 
 ## 约定
 
-- Go：安装在 `C:\Program Files\Go\bin`。测试用 `cd server && go test ./...`。不引入第三方依赖，除非有充分理由。
+- Go：安装在 `C:\Program Files\Go\bin`。测试用 `cd server && go test ./...`（Redis 用 miniredis 模拟，测试不需要真 Redis）。本地运行需要 Redis：`docker run -d --name ukiyo-redis -p 6379:6379 redis:7`。第三方依赖只限 `modernc.org/sqlite`、`github.com/redis/go-redis`、`github.com/golang-jwt/jwt`，以及测试用的 `github.com/alicebob/miniredis`；再加别的需要有充分理由。
 - 安卓：技术选型和依赖白名单以 `docs/requirements.md` 第 7 节为准。minSdk 29，不依赖 Google Play 服务。
 - 核心原则：原图字节不能被改动，接收方不留副本。每个功能都按这两条验收。
