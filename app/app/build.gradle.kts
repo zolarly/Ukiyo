@@ -1,3 +1,5 @@
+import java.net.URI
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
@@ -6,7 +8,7 @@ plugins {
 android {
     namespace = "io.github.zolarly.ukiyo"
     compileSdk {
-        version = release(37)
+        version = release(37) { minorApiLevel = 1 }
     }
 
     defaultConfig {
@@ -17,6 +19,9 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        val server = providers.gradleProperty("ukiyo.server").get()
+        buildConfigField("String", "DEFAULT_SERVER", "\"$server\"")
+        manifestPlaceholders["ukiyoHost"] = URI(server).host
     }
 
     buildTypes {
@@ -33,6 +38,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 
@@ -45,7 +51,11 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation(libs.okhttp)
+    implementation(libs.okhttp.coroutines)
     testImplementation(libs.junit)
+    testImplementation(libs.org.json)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     androidTestImplementation(libs.androidx.espresso.core)

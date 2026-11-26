@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 局域网联调用 http；release 包不包含这个文件，只能走 HTTPS -->
+    <application android:usesCleartextTraffic="true">
+        <activity android:name=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="http" android:host="${ukiyoHost}" android:pathPrefix="/s/" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
